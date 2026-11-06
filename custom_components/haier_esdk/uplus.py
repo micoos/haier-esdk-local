@@ -67,6 +67,11 @@ CONTROL_TEMPLATE = bytes([
 ])
 
 STATUS_OPCODE = 0x6D01
+# A control frame we built ourselves carries the same field layout at the
+# same offsets, but announces 6001. read_status() accepts both so a frame
+# can be read back after building it -- which is how the entity layer
+# checks what it just asked for.
+CONTROL_OPCODE = 0x6001
 # Byte 3 of every frame in this dialect. Upstream's gen-1 frames carry 0x00
 # there, so this tells the two apart even though both use opcode 6d01.
 HEADER_MARKER = 0x40
@@ -105,7 +110,8 @@ def is_status_frame(frame: bytes) -> bool:
     return (len(frame) > TEMPERATURE_OFFSET
             and frame[:2] == b"\xff\xff"
             and frame[3] == HEADER_MARKER
-            and int.from_bytes(frame[10:12], "big") == STATUS_OPCODE)
+            and int.from_bytes(frame[10:12], "big") in (STATUS_OPCODE,
+                                                        CONTROL_OPCODE))
 
 
 def read_status(frame: bytes) -> dict | None:

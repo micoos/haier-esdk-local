@@ -261,7 +261,7 @@ class HaierStatus:
 
     # 写（返回新的 24 字节块；cntrl 归 0，与 ESPHome 一致）
     def copy(self) -> "HaierStatus":
-        return HaierStatus(bytes(self.raw))
+        return HaierStatus(bytes(self.raw), dialect=self.dialect)
 
     def with_power(self, on: bool) -> "HaierStatus":
         s = self.copy()
@@ -303,6 +303,13 @@ class HaierStatus:
         return self.with_byte(15, 1 if on else 0).with_bits(19, 0x01, False)
 
     def with_health(self, on: bool) -> "HaierStatus":
+        if self.dialect == "uplus":
+            u = self._u
+            frame = uplus.build_control(
+                mode=u.get("mode", "auto"), fan=u.get("fan", "auto"),
+                target_temperature=u.get("target_temperature", 20.0),
+                power=bool(u.get("power")), health=on)
+            return HaierStatus(frame, dialect="uplus")
         return self.with_bits(17, 0x08, on)
 
     def with_byte(self, index: int, value: int) -> "HaierStatus":
@@ -314,7 +321,18 @@ class HaierStatus:
         return s
 
     def with_bits(self, index: int, mask: int, on: bool) -> "HaierStatus":
-        """按位改（掩码置位 / 清位）。"""
+        """按位改（掩码置位 / 清位）。
+
+        On uplus boards the caller passes gen-1 coordinates (byte 17 bit 3
+        for health). Those do not exist in this dialect -- health is bit 1
+        of the same byte -- and a status frame cannot be poked and sent
+        back anyway, so translate the intent and build a control frame.
+        """
+        if self.dialect == "uplus":
+            if index == 17 and mask == 0x08:          # health
+                return self.with_health(on)
+            raise ValueError(
+                "bit %d/%#04x wordt niet ondersteund op uplus" % (index, mask))
         value = self.raw[index] | mask if on else self.raw[index] & ~mask
         return self.with_byte(index, value)
 

@@ -49,7 +49,14 @@ class _BitSwitch(CoordinatorEntity[HaierCoordinator], SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self.coordinator.data.raw[self._byte] & self._mask)
+        st = self.coordinator.data
+        # uplus frames carry these flags at different bit positions, and
+        # `raw` is a whole frame there rather than a 24-byte block, so go
+        # through the decoded property when the status offers one.
+        naam = getattr(self, "_decoded", None)
+        if naam and getattr(st, "dialect", "esdk") == "uplus":
+            return bool(getattr(st, naam))
+        return bool(st.raw[self._byte] & self._mask)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         await self.coordinator.async_write(
@@ -67,6 +74,7 @@ class HaierHealthSwitch(_BitSwitch):
     _attr_icon = "mdi:heart-pulse"
     _byte, _mask = HEALTH_BYTE, HEALTH_MASK
     _suffix = "health"
+    _decoded = "health"
 
 
 class HaierRemoteLockSwitch(_BitSwitch):
