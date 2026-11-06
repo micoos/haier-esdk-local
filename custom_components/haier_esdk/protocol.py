@@ -35,6 +35,8 @@ from __future__ import annotations
 import dataclasses
 import struct
 
+from . import uplus
+
 MAGIC_REQUEST = b"\x00\x00\x27\x14"
 MAGIC_RESPONSE = b"\x00\x00\x27\x15"
 HEADER_LEN = 80
@@ -98,9 +100,20 @@ def parse_epp(frame: bytes) -> EppFrame | None:
     if len(frame) < 3 + length:
         return None
     body = frame[3:3 + length]
+    # uplus frames trailer the length-counted body with an XOR byte plus a
+    # CRC16, so the useful bytes run past 3+length; gen-1 frames end there.
+    is_uplus = len(frame) > 3 and frame[3] == uplus.HEADER_MARKER
+    if is_uplus:
+        end = 2 + length
+        raw = frame[:min(len(frame), end + 3)]
+        checksum_ok = (len(frame) >= end + 3
+                       and uplus.crc16(frame[2:end]) ==
+                       ((frame[end + 1] << 8) | frame[end + 2]))
+    else:
+        raw = frame[:3 + length]
+        checksum_ok = (sum(frame[2:2 + length]) & 0xFF) == body[-1]
     return EppFrame(addr=body[:6], frame_type=body[6], data=body[7:-1],
-                    checksum_ok=((sum(frame[2:2 + length]) & 0xFF) == body[-1]),
-                    raw=frame[:3 + length])
+                    checksum_ok=checksum_ok, raw=raw)
 
 
 # ----------------------------------------------------------------------- 信封
@@ -147,15 +160,36 @@ def parse_envelopes(buf: bytes) -> tuple[list[Envelope], bytes]:
 # ------------------------------------------------------------------ 状态块
 @dataclasses.dataclass
 class HaierStatus:
-    """smartair2 的 24 字节控制块。"""
+    """The control block, in whichever dialect the board speaks.
+
+    Two wire formats share this class so everything above it (climate.py,
+    switch.py, coordinator.py) stays dialect-agnostic:
+
+    * gen-1 eSDK -- `raw` is the 24-byte control block of big-endian words,
+      the original layout this integration was written for.
+    * uplus/KZW  -- `raw` is the WHOLE frame and fields sit at byte offsets
+      (see uplus.py). `uplus-haier-ac-*` modules speak this one; reading
+      gen-1 offsets gives silent nonsense and every write is refused.
+    """
     raw: bytes
+    dialect: str = "esdk"
 
     def __post_init__(self) -> None:
-        if len(self.raw) != 24:
+        if self.dialect == "esdk" and len(self.raw) != 24:
             raise ValueError(f"控制块必须 24 字节，收到 {len(self.raw)}")
+
+    @property
+    def _u(self) -> dict:
+        """Decoded uplus fields; only touched when dialect == "uplus"."""
+        return uplus.read_status(self.raw) or {}
 
     @classmethod
     def from_frame(cls, frame: EppFrame) -> "HaierStatus":
+        # Byte 3 of the raw frame tells the dialects apart (0x40 vs 0x00).
+        if frame.raw and len(frame.raw) > 3 and frame.raw[3] == uplus.HEADER_MARKER:
+            if uplus.read_status(frame.raw) is None:
+                raise ValueError(f"uplus-frame onleesbaar: {frame.raw.hex()}")
+            return cls(bytes(frame.raw), dialect="uplus")
         if len(frame.data) < 26:
             raise ValueError(f"状态帧太短：{len(frame.data)}")
         return cls(bytes(frame.data[2:26]))
@@ -163,30 +197,47 @@ class HaierStatus:
     # 读
     @property
     def power(self) -> bool:
+        if self.dialect == "uplus":
+            return bool(self._u.get("power"))
         return bool(self.raw[17] & 0x01)
 
     @property
     def room_temperature(self) -> float:
+        if self.dialect == "uplus":
+            # Half-degree resolution on these boards, hence the .5 values.
+            return float(self._u.get("room_temperature", 0.0))
         return float(self.raw[1])
 
     @property
     def room_humidity(self) -> int:
+        if self.dialect == "uplus":
+            # Not carried in this dialect's status frame; 0 would read as a
+            # real measurement, so report nothing.
+            return 0
         return self.raw[3]
 
     @property
     def target_temperature(self) -> float:
+        if self.dialect == "uplus":
+            return float(self._u.get("target_temperature", 16.0))
         return float(self.raw[23] + 16)
 
     @property
     def mode(self) -> str:
+        if self.dialect == "uplus":
+            return self._u.get("mode", "auto")
         return MODES.get(self.raw[11], f"0x{self.raw[11]:02x}")
 
     @property
     def fan(self) -> str:
+        if self.dialect == "uplus":
+            return self._u.get("fan", "auto")
         return FANS.get(self.raw[13], f"0x{self.raw[13]:02x}")
 
     @property
     def health(self) -> bool:
+        if self.dialect == "uplus":
+            return bool(self._u.get("health"))
         return bool(self.raw[17] & 0x08)
 
     @property

@@ -17,6 +17,7 @@ import socket
 import time
 from typing import Callable
 
+from . import uplus
 from .protocol import (ADDR_AC, ADDR_MODULE, CMD_GET_STATUS, CMD_POWER_OFF, CMD_POWER_ON,
                        CMD_SET, FANS, MODES, TYPE_ALARM_RESPONSE, TYPE_GET_ALARM,
                        TYPE_INVALID, TYPE_REPORT, TYPE_STATUS, Envelope, HaierStatus,
@@ -91,6 +92,20 @@ class HaierClient:
             self._sock = None
 
     # ------------------------------------------------------------------ 收发
+    @property
+    def dialect(self) -> str:
+        """Which wire format this board speaks: "uplus" or "esdk".
+
+        Read from the frames the module pushes on connect, so it costs no
+        extra round trip. Defaults to the upstream gen-1 format when the
+        burst told us nothing.
+        """
+        for env in self.burst:
+            raw = env.frame.raw
+            if raw and len(raw) > 3 and raw[3] == uplus.HEADER_MARKER:
+                return "uplus"
+        return "esdk"
+
     @staticmethod
     def _is_status(env: Envelope) -> bool:
         return env.frame.frame_type in (TYPE_STATUS, TYPE_REPORT) and env.frame.subcommand == 0x6D01
@@ -143,7 +158,14 @@ class HaierClient:
 
     # ------------------------------------------------------------------ 读
     def read_status(self) -> HaierStatus:
-        """4d01：读完整状态。"""
+        """4d01：读完整状态。
+
+        uplus boards want their own literal poll frame (it carries an XOR +
+        CRC16 trailer, not a byte sum), so once the connect burst has told us
+        the dialect we use that one.
+        """
+        if self.dialect == "uplus":
+            return HaierStatus.from_frame(self.request(uplus.build_poll()).frame)
         return HaierStatus.from_frame(self.request(epp_frame(CMD_GET_STATUS_WORD, addr=ADDR_AC)).frame)
 
     def status_from_burst(self) -> HaierStatus | None:
@@ -161,7 +183,20 @@ class HaierClient:
 
     # ------------------------------------------------------------------ 写
     def set_power(self, on: bool) -> HaierStatus:
-        """4d02/4d03：开机 / 关机。"""
+        """4d02/4d03：开机 / 关机。
+
+        On uplus boards 4d02/4d03 are refused (INVALID). Power-off has its own
+        literal frame there, and power-on rides along with a full control
+        frame, so it needs the current state to preserve mode/fan/setpoint.
+        """
+        if self.dialect == "uplus":
+            if not on:
+                return HaierStatus.from_frame(self.request(uplus.build_power_off()).frame)
+            cur = self.status_from_burst() or self.read_status()
+            return HaierStatus.from_frame(self.request(uplus.build_control(
+                mode=cur.mode, fan=cur.fan,
+                target_temperature=cur.target_temperature,
+                power=True, health=cur.health)).frame)
         cmd = CMD_POWER_ON if on else CMD_POWER_OFF
         return HaierStatus.from_frame(self.request(epp_frame(cmd.to_bytes(2, "big"),
                                                              addr=ADDR_AC)).frame)
@@ -187,6 +222,20 @@ class HaierClient:
         没收到推送才补一条 4d01。
         """
         current = self.status_from_burst() or self.read_status()
+        if self.dialect == "uplus":
+            if power is False:
+                return self.set_power(False)
+            return HaierStatus.from_frame(self.request(uplus.build_control(
+                mode=(mode or current.mode),
+                fan=(fan or current.fan),
+                target_temperature=(current.target_temperature
+                                    if temperature is None else temperature),
+                # Any control frame carries the power bit, so a field change
+                # on a unit that is off would silently switch it on. Only turn
+                # it on when asked, or when it already was.
+                power=(current.power if power is None else power),
+                health=(current.health if health is None else health),
+            )).frame)
         handled_power = False
         if power is not None and power != current.power:
             current = self.set_power(power)
